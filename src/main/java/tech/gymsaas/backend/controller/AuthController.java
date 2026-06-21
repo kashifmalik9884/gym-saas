@@ -9,6 +9,7 @@ import tech.gymsaas.backend.service.AuthService;
 
 @RestController
 @RequestMapping("/api/auth")
+@CrossOrigin(origins = {"https://frontend-ahgr.onrender.com", "https://frontend-abgr.onrender.com"}, allowCredentials = "true")
 public class AuthController {
 
     private final AuthService authService;
