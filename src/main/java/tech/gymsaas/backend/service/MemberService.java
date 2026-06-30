@@ -1,6 +1,7 @@
 package tech.gymsaas.backend.service;
 
-import org.springframework.beans.factory.annotation.Value;
+import com.cloudinary.Cloudinary;
+import com.cloudinary.utils.ObjectUtils;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -9,17 +10,15 @@ import tech.gymsaas.backend.dto.member.MemberRequest;
 import tech.gymsaas.backend.dto.member.MemberResponse;
 import tech.gymsaas.backend.entity.Gym;
 import tech.gymsaas.backend.entity.Member;
-import tech.gymsaas.backend.entity.User;
 import tech.gymsaas.backend.exception.ResourceNotFoundException;
 import tech.gymsaas.backend.repository.MemberRepository;
 import tech.gymsaas.backend.repository.UserRepository;
 
 import java.io.IOException;
-import java.nio.file.*;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
 
 @Service
 public class MemberService {
@@ -27,26 +26,23 @@ public class MemberService {
     private final MemberRepository memberRepository;
     private final UserRepository userRepository;
     private final tech.gymsaas.backend.repository.GymRepository gymRepository;
-
-    @Value("${app.upload.dir}")
-    private String uploadDir;
-
-    @Value("${app.upload.base-url}")
-    private String uploadBaseUrl;
+    private final Cloudinary cloudinary; // 🌟 Injecting Cloudinary engine
 
     public MemberService(MemberRepository memberRepository,
                          UserRepository userRepository,
-                         tech.gymsaas.backend.repository.GymRepository gymRepository) { // 2. Update constructor
+                         tech.gymsaas.backend.repository.GymRepository gymRepository,
+                         Cloudinary cloudinary) { // Added Cloudinary to constructor injection
         this.memberRepository = memberRepository;
         this.userRepository = userRepository;
         this.gymRepository = gymRepository;
+        this.cloudinary = cloudinary;
     }
 
     public List<MemberResponse> getAllMembers(Authentication authentication) {
         Long gymId = getCurrentGymId(authentication);
         return memberRepository.findByGym_IdOrderByCreatedAtDesc(gymId)
                 .stream()
-                .map(member -> this.toResponse(member, gymId)) // <-- Pass gymId here
+                .map(member -> this.toResponse(member, gymId))
                 .toList();
     }
 
@@ -54,7 +50,7 @@ public class MemberService {
         Long gymId = getCurrentGymId(authentication);
         Member member = memberRepository.findByIdAndGym_Id(id, gymId)
                 .orElseThrow(() -> new ResourceNotFoundException("Member not found"));
-        return toResponse(member, gymId); // <-- Pass gymId here
+        return toResponse(member, gymId);
     }
 
     public List<MemberResponse> getDueSoonMembers(Authentication authentication) {
@@ -65,10 +61,11 @@ public class MemberService {
         return memberRepository
                 .findByGym_IdAndActiveTrueAndNextDueDateBetweenOrderByNextDueDateAsc(gymId, today, dueLimit)
                 .stream()
-                .map(member -> this.toResponse(member, gymId)) // <-- Pass gymId here
+                .map(member -> this.toResponse(member, gymId))
                 .toList();
     }
 
+    @Transactional
     public MemberResponse createMember(MemberRequest request, MultipartFile photo, Authentication authentication) {
         Gym gym = getCurrentGym(authentication);
 
@@ -91,12 +88,13 @@ public class MemberService {
         applyDefaults(member, true);
 
         if (photo != null && !photo.isEmpty()) {
-            member.setPhotoUrl(storePhoto(photo));
+            member.setPhotoUrl(uploadToCloudinary(photo));
         }
 
         return toResponse(memberRepository.save(member), gym.getId());
     }
 
+    @Transactional
     public MemberResponse updateMember(Long id,
                                        MemberRequest request,
                                        MultipartFile photo,
@@ -119,7 +117,7 @@ public class MemberService {
         existing.setBiometricUserId(request.getBiometricUserId());
 
         if (photo != null && !photo.isEmpty()) {
-            existing.setPhotoUrl(storePhoto(photo));
+            existing.setPhotoUrl(uploadToCloudinary(photo));
         } else {
             existing.setPhotoUrl(request.getPhotoUrl());
         }
@@ -151,8 +149,6 @@ public class MemberService {
 
     private Gym getCurrentGym(Authentication authentication) {
         Long gymId = getCurrentGymId(authentication);
-
-        // Safely fetch the Gym record explicitly by its ID to avoid lazy loading proxy crashes
         return gymRepository.findById(gymId)
                 .orElseThrow(() -> new ResourceNotFoundException("Gym account not found with ID: " + gymId));
     }
@@ -164,15 +160,13 @@ public class MemberService {
 
         Object principal = authentication.getPrincipal();
 
-        // Direct check for your optimized custom principal
         if (principal instanceof tech.gymsaas.backend.security.UserPrincipal) {
             Long gymId = ((tech.gymsaas.backend.security.UserPrincipal) principal).getGymId();
             if (gymId != null) {
-                return gymId; // 🌟 Returns instantly without hitting the database a second time!
+                return gymId;
             }
         }
 
-        // Fallback profile lookups should be avoided if possible
         String email = authentication.getName();
         return userRepository.findByEmailIgnoreCase(email)
                 .map(user -> {
@@ -207,33 +201,26 @@ public class MemberService {
         return nextMonth.withDayOfMonth(Math.min(targetDay, maxDay));
     }
 
-    private String storePhoto(MultipartFile photo) {
+  
+    private String uploadToCloudinary(MultipartFile photo) {
         try {
-            String originalName = photo.getOriginalFilename();
-            String extension = "";
+            // Options map can configure custom folders or optimizations if desired
+            Map<?, ?> uploadResult = cloudinary.uploader().upload(
+                    photo.getBytes(),
+                    ObjectUtils.asMap("folder", "gym-member-photos")
+            );
 
-            if (originalName != null && originalName.contains(".")) {
-                extension = originalName.substring(originalName.lastIndexOf("."));
-            }
-
-            String fileName = UUID.randomUUID() + extension;
-            Path uploadPath = Paths.get(uploadDir).toAbsolutePath().normalize();
-
-            Files.createDirectories(uploadPath);
-
-            Path filePath = uploadPath.resolve(fileName);
-            Files.copy(photo.getInputStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
-
-            return uploadBaseUrl + "/" + fileName;
+            // This pulls the absolute "https://res.cloudinary.com/..." URL string
+            return uploadResult.get("secure_url").toString();
         } catch (IOException e) {
-            throw new RuntimeException("Failed to store photo");
+            throw new RuntimeException("Cloudinary media upload failed: " + e.getMessage());
         }
     }
 
     private MemberResponse toResponse(Member member, Long fallbackGymId) {
         return MemberResponse.builder()
                 .id(member.getId())
-                .gymId(fallbackGymId) // 🌟 Direct assignment! No proxy triggers, no extra database hits.
+                .gymId(fallbackGymId)
                 .name(member.getName())
                 .phone(member.getPhone())
                 .monthlyFee(member.getMonthlyFee())
